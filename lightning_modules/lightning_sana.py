@@ -36,7 +36,7 @@ class SanaLightning(nn.Module):
         self.pipeline = SanaPipeline.from_pretrained(
             "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
             torch_dtype=torch.bfloat16,
-            text_encoder=None,
+            # text_encoder=None,
         )
         self.denoiser = self.pipeline.transformer
         self.denoiser.to("cuda")
@@ -65,7 +65,7 @@ class SanaLightning(nn.Module):
         rank=32,
         alpha=32,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0."],
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     ):
         transformer_lora_config = LoraConfig(
             r=rank,
@@ -80,12 +80,14 @@ class SanaLightning(nn.Module):
         latents: torch.Tensor = None,
         timestep: int = None,
         prompt_embeds: torch.Tensor = None,
+        prompt_attention_mask: torch.Tensor = None,
         **kwargs,
     ):
         noise_pred = self.denoiser(
-            hidden_states=latents,
+            hidden_states=latents.to(self.denoiser.dtype),
             timestep=timestep,
-            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states=prompt_embeds.to(self.denoiser.dtype),
+            encoder_attention_mask=prompt_attention_mask,
             return_dict=False,
         )[0]
         return noise_pred.float()
@@ -104,23 +106,30 @@ class SanaLightning(nn.Module):
 
     @torch.no_grad()
     def validation_step(self, batch, lora_path):
-        self.pipeline.load_lora_weights(lora_path)
+        pipeline = SanaPipeline.from_pretrained(
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            torch_dtype=torch.float32,
+        )
+        pipeline.transformer = pipeline.transformer.to(torch.bfloat16)
+        pipeline.load_lora_weights(lora_path)
         feeds, targets, metadata = batch
         prompt_embeds = feeds["prompt_embeds"][:1]
-        pooled_prompt_embeds = feeds["pooled_prompt_embeds"][:1]
+        prompt_attention_mask = feeds["prompt_attention_mask"][:1]
         width = 768
         height = 1024
         steps = 20
         image = self.pipeline(
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
+            prompt_embeds=prompt_embeds.to(pipeline.transformer.dtype),
+            prompt_attention_mask=prompt_attention_mask,
             height=height,
             width=width,
             num_inference_steps=steps,
             generator=torch.Generator().manual_seed(42),
         ).images[0]
-        image = wandb.Image(image, caption="TODO: Add caption")
+        print(metadata)
+        image = wandb.Image(image, caption="Prompt: " + metadata[0]["prompt"])
         wandb.log({f"Validation image": image})
+        del pipeline
 
     def configure_optimizers(self):
         params_to_optimize = list(
@@ -133,9 +142,9 @@ class SanaLightning(nn.Module):
         )
         return optimizer
 
-    def save_lora(self, path: str):
-        transformer_lora_layers = get_peft_model_state_dict(self.denoiser)
-        diffusers.FluxPipeline.save_lora_weights(
+    def save_lora(self, path: str, model):
+        transformer_lora_layers = get_peft_model_state_dict(model)
+        diffusers.SanaPipeline.save_lora_weights(
             save_directory=path,
             transformer_lora_layers=transformer_lora_layers,
         )

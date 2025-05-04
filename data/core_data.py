@@ -6,7 +6,20 @@ import glob
 import random
 import os
 from PIL import Image
+from diffusers.training_utils import (
+    compute_density_for_timestep_sampling,
+)
+from diffusers import FlowMatchEulerDiscreteScheduler
 
+def get_sigmas(noise_scheduler, timesteps, n_dim=4, dtype=torch.float32):
+    sigmas = noise_scheduler.sigmas
+    schedule_timesteps = noise_scheduler.timesteps
+    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+    sigma = sigmas[step_indices].flatten()
+    while len(sigma.shape) < n_dim:
+        sigma = sigma.unsqueeze(-1)
+    return sigma
 
 class CoreDataset(Dataset):
     def __init__(self, metadata_file: str, root_folder: str):
@@ -22,33 +35,41 @@ class CoreDataset(Dataset):
         max_size: int = 1536,
         divisible: int = 32,
     ):
-        widths = [
-            base_size - divisible * i
-            for i in range(1, (base_size - min_size) // divisible)
-        ] + [
-            base_size + divisible * i
-            for i in range(1, (max_size - base_size) // divisible)
-        ]
-        heights = [
-            base_size - divisible * i
-            for i in range(1, (base_size - min_size) // divisible)
-        ] + [
-            base_size + divisible * i
-            for i in range(1, (max_size - base_size) // divisible)
-        ]
-        sizes = {}
-        base_res = (base_size * base_size) ** -2
-        for width in widths:
-            for height in heights:
-                res = (width * height) ** -2
-                if not (base_res * 8 < res < base_res * 1.1):
+        """
+        Build a dictionary that maps aspect-ratio (w / h, rounded) to
+        (width, height) tuples whose area lies roughly within
+        [1/8 × base_area, 1.1 × base_area].
+
+        Returns
+        -------
+        dict[float, tuple[int, int]]
+        """
+        # --- 1. Generate every multiple of `divisible` in [min_size, max_size] ---
+        widths  = list(range(min_size, max_size + 1, divisible))
+        heights = widths[:]                         # same grid for height
+
+        sizes: dict[float, tuple[int, int]] = {}
+        base_area = base_size * base_size           # 1024×1024 by default
+
+        for w in widths:
+            for h in heights:
+                area = w * h
+
+                # --- 2. Keep pairs whose area is “near” the baseline area ---
+                if not (base_area / 8 <= area <= base_area * 1.1):
                     continue
-                ratio = width / height
-                sizes[ratio] = (width, height)
+
+                # --- 3. Use rounded ratio as key; newer entry overwrites older ---
+                ratio = round(w / h, 5)
+                sizes[ratio] = (w, h)
+
+        # --- 4. Verbose summary ---------------------------------------------------
         print(f"Initialized {len(sizes)} bucket sizes")
-        for k, v in sizes:
-            print(f"Bucket ratio: {k} size: {v}")
+        for ratio, wh in sizes.items():
+            print(f"Bucket ratio: {ratio:.3f}   size: {wh}")
+
         return sizes
+
 
     def __len__(self):
         return len(self.metadata)
@@ -69,33 +90,51 @@ class CoreDataset(Dataset):
 
 
 class CoreCachedDataset(Dataset):
-    def __init__(self, cached_folder: str, max_len: int = 512):
-        self.cached_files = glob.glob(f"{cached_folder}/*.pt")
+    def __init__(self, cached_folder: str, max_len: int = 512, prefix: str = "cache_"):
+        self.cached_files = glob.glob(f"{cached_folder}/{prefix}*.pt")
         self.max_len = max_len
         self.max_step = 1000
+        self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers", subfolder="scheduler",
+        )
 
     def __len__(self):
         return len(self.cached_files)
 
     def add_noise(self, latent: torch.Tensor, dtype: torch.dtype):
-        sigma = random.random()
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme="logit_normal",
+            batch_size=latent.shape[0],
+            logit_mean=0,
+            logit_std=1,
+            mode_scale=1.29,
+        )
+        # print("u", u)
+        indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
+        # print("indices", indices)
+        timesteps = self.noise_scheduler.timesteps[indices]
+        # print("timesteps", timesteps)
+        sigmas = get_sigmas(self.noise_scheduler, timesteps)
+        # print("sigmas", sigmas)
         noise = torch.randn_like(latent).to(dtype)
-        noised_latent = (1 - sigma) * latent + sigma * noise
-        return noised_latent, sigma, noise
+        noised_latent = (1 - sigmas) * latent + sigmas * noise
+        return noised_latent, sigmas, noise, timesteps
 
     def __getitem__(self, index):
         cached_file = self.cached_files[index]
         feeds = torch.load(cached_file)
         latent = feeds["latents"]
         dtype = latent.dtype
-        noised_latent, sigma, noise = self.add_noise(latent, dtype)
+        noised_latent, sigma, noise, timesteps = self.add_noise(latent, dtype)
         feeds["timestep"] = torch.Tensor([sigma])
         feeds["latents"] = noised_latent
+        prompt = feeds.pop("prompt")
         step = int(sigma * self.max_step)
         target = noise - latent
         metadata = {
-            "step": step,
+            "step": timesteps,
             "sigma": sigma,
+            "prompt": prompt,
         }
 
         return feeds, target, metadata
