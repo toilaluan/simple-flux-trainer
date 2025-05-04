@@ -17,7 +17,7 @@ class CacheFlux:
         self.save_dir = save_dir
         self.guidance_scale = 3.5
         self.pretrained_path = pretrained_path
-        self.pipeline = diffusers.FluxPipeline.from_pretrained(
+        self.pipeline = diffusers.SanaPipeline.from_pretrained(
             pretrained_path, transformer=None, torch_dtype=torch_dtype
         )
         self.transformer_config = transformers.PretrainedConfig.from_pretrained(
@@ -40,7 +40,6 @@ class CacheFlux:
             text_ids,
         ) = self.pipeline.encode_prompt(
             prompt=prompt,
-            prompt_2=prompt,
             device=self.device,
             num_images_per_prompt=1,
             max_sequence_length=256,
